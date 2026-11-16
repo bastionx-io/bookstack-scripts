@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 if [[ "${1:-}" == --help && $# == 1 ]]; then
-  printf '%s\n' 'Usage: bash install-aws-cli.sh [--help]' \
+  printf '%s\n' 'Usage: bash 01-install-aws-cli.sh [--help]' \
     'Installs AWS CLI 2.40.3 for Linux x86_64, without updating existing installs.' \
     'Run as a normal user; sudo is used only for the verified installer.' \
     'Requires curl, unzip, gpg, python3, sudo and standard Linux utilities.' \

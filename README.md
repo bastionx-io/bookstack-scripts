@@ -6,7 +6,7 @@ change services or reboot. No Git is needed on the target machine.
 
 ## Publish only these files
 
-Create a **separate, clean public repository**, with only `install-aws-cli.sh`,
+Create a **separate, clean public repository**, with only `01-install-aws-cli.sh`,
 `SHA256SUMS` and this `README.md` at its root. Copy these three files only.
 Do not publish the source repository, its history, other documentation, tests,
 configuration, logs or machine-specific information. Review the public files
@@ -51,13 +51,13 @@ umask 077
 download=$(mktemp -d /tmp/client-tools.XXXXXXXX)
 cd "$download"
 curl --proto '=https' --proto-redir '=https' --fail --show-error --location \
-  --connect-timeout 10 --max-time 60 --output install-aws-cli.sh \
-  'https://raw.githubusercontent.com/OWNER/REPO/FULL_COMMIT/install-aws-cli.sh'
-printf '%s  install-aws-cli.sh\n' 'TRUSTED_SHA256' | sha256sum --check --strict -
-bash install-aws-cli.sh --help
+  --connect-timeout 10 --max-time 60 --output 01-install-aws-cli.sh \
+  'https://raw.githubusercontent.com/OWNER/REPO/FULL_COMMIT/01-install-aws-cli.sh'
+printf '%s  01-install-aws-cli.sh\n' 'TRUSTED_SHA256' | sha256sum --check --strict -
+bash 01-install-aws-cli.sh --help
 log=$(mktemp /tmp/aws-cli-install.XXXXXXXX.log)
 printf 'Download retained: %s\nPrivate log retained: %s\n' "$download" "$log"
-if bash install-aws-cli.sh > "$log" 2>&1; then
+if bash 01-install-aws-cli.sh > "$log" 2>&1; then
   printf 'Installer exited successfully; review the private log.\n'
 else
   status=$?
