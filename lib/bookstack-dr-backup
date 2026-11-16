@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# BookStack online backup to S3-compatible storage.
+# Production execution requires completion of the documented validation checklist.
+
+set -Eeuo pipefail
+umask 077
+
+readonly SCRIPT_NAME="bookstack-dr-backup"
+readonly SCRIPT_VERSION="0.2.0"
+
+CONFIG_FILE="${BOOKSTACK_BACKUP_CONFIG:-/etc/bookstack-dr-backup/config}"
+MODE="backup"
+
+usage() {
+  cat <<'EOF'
+Usage: bookstack-dr-backup [--preflight] [--help]
+
+  --preflight  Validate configuration, tools, database access, table engines,
+               source files, staging capacity, and S3 access configuration.
+               Does not create or upload a backup.
+  --help       Show this help.
+
+The configuration path defaults to /etc/bookstack-dr-backup/config and can be
+changed with BOOKSTACK_BACKUP_CONFIG.
+EOF
+}
+
+(( $# <= 1 )) || { usage >&2; exit 2; }
+case "${1:-}" in
+  "") ;;
+  --preflight) MODE="preflight" ;;
+  --help|-h) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+log() {
+  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCRIPT_NAME" "$*" >&2
+}
+
+fatal() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fatal "Required command not found: $1"
+}
+
+require_file() {
+  [[ -f "$1" ]] || fatal "Required file not found: $1"
+}
+
+require_directory() {
+  [[ -d "$1" ]] || fatal "Required directory not found: $1"
+}
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes) return 0 ;;
+    0|false|no) return 1 ;;
+    *) fatal "Expected a boolean value, got: $1" ;;
+  esac
+}
+
+require_private_file() {
+  local path="$1" forbidden_permissions="${2:-077}" owner mode
+  require_file "$path"
+  [[ ! -L "$path" && -r "$path" ]] || fatal "Expected a readable, non-symlink configuration file: $path"
+  read -r owner mode < <(stat -c '%u %a' -- "$path")
+  [[ "$owner" == "$EUID" ]] || fatal "Configuration file must belong to the executing user: $path"
+  (( (8#$mode & 8#$forbidden_permissions) == 0 )) || fatal "Unsafe group/other permissions on configuration file: $path"
+}
+
+run_bounded() {
+  local seconds="$1"
+  shift
+  timeout --signal=TERM --kill-after=5s "${seconds}s" "$@"
+}
+
+require_private_file "$CONFIG_FILE"
+# This is trusted shell configuration, checked before it can execute.
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+: "${BOOKSTACK_ROOT:=/var/www/bookstack}"
+: "${DB_NAME:=bookstack}"
+: "${MYSQL_DEFAULTS_FILE:=}"
+: "${SOURCE_APP_URL:?SOURCE_APP_URL must be set in configuration}"
+: "${STAGING_ROOT:=/var/lib/bookstack-dr-backup/staging}"
+: "${LOCK_FILE:=/run/bookstack-dr-backup/backup.lock}"
+: "${MIN_FREE_MIB:=2048}"
+: "${REQUIRE_ALL_INNODB:=true}"
+: "${KEEP_FAILED_STAGING:=true}"
+: "${AGE_RECIPIENT_FILE:=/etc/bookstack-dr-backup/age-recipient.txt}"
+: "${S3_ENDPOINT_URL:=}"
+: "${S3_BUCKET:=}"
+: "${S3_PREFIX:?S3_PREFIX must be set in configuration}"
+: "${AWS_REGION:=garage}"
+: "${AWS_PROFILE:=bookstack-backup}"
+: "${AWS_CONFIG_FILE:=/etc/bookstack-dr-backup/aws-config}"
+: "${AWS_SHARED_CREDENTIALS_FILE:=/etc/bookstack-dr-backup/aws-credentials}"
+: "${AWS_CA_BUNDLE:=}"
+: "${VERIFY_REMOTE_SIZE:=true}"
+: "${MAX_STAGING_MIB:=512}"
+: "${MYSQL_QUERY_TIMEOUT_SECONDS:=20}"
+: "${DUMP_TIMEOUT_SECONDS:=300}"
+: "${FILE_TIMEOUT_SECONDS:=120}"
+: "${S3_TIMEOUT_SECONDS:=300}"
+
+[[ "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]] || fatal "DB_NAME contains unsupported characters"
+for setting in MIN_FREE_MIB MAX_STAGING_MIB MYSQL_QUERY_TIMEOUT_SECONDS DUMP_TIMEOUT_SECONDS FILE_TIMEOUT_SECONDS S3_TIMEOUT_SECONDS; do
+  [[ "${!setting}" =~ ^[1-9][0-9]{0,6}$ ]] || fatal "$setting must be a positive integer of at most seven digits"
+done
+for setting in REQUIRE_ALL_INNODB KEEP_FAILED_STAGING VERIFY_REMOTE_SIZE; do
+  case "${!setting,,}" in
+    1|true|yes|0|false|no) ;;
+    *) fatal "$setting must be a boolean" ;;
+  esac
+done
+is_true "$REQUIRE_ALL_INNODB" || fatal "REQUIRE_ALL_INNODB must stay enabled; nontransactional backup is not supported"
+[[ "$S3_ENDPOINT_URL" == https://?* && "$S3_ENDPOINT_URL" != *'@'* ]] || fatal "S3_ENDPOINT_URL must use HTTPS without embedded credentials"
+[[ "$S3_BUCKET" =~ ^[a-z0-9][a-z0-9.-]+$ ]] || fatal "S3_BUCKET must be a nonempty lowercase bucket name"
+S3_PREFIX="${S3_PREFIX#/}"
+S3_PREFIX="${S3_PREFIX%/}"
+[[ "$S3_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9/_-]*$ ]] || fatal "S3_PREFIX is empty or contains unsupported characters"
+
+for command_name in mysql mysqldump rsync tar gzip age sha256sum aws flock python3 stat df od timeout du find realpath; do
+  require_command "$command_name"
+done
+
+require_directory "$BOOKSTACK_ROOT"
+require_directory "$BOOKSTACK_ROOT/public/uploads"
+require_directory "$BOOKSTACK_ROOT/storage/uploads"
+require_directory "$BOOKSTACK_ROOT/themes"
+require_file "$BOOKSTACK_ROOT/.env"
+require_file "$BOOKSTACK_ROOT/version"
+require_private_file "$AGE_RECIPIENT_FILE" 022
+require_private_file "$AWS_CONFIG_FILE"
+require_private_file "$AWS_SHARED_CREDENTIALS_FILE"
+if [[ -n "$MYSQL_DEFAULTS_FILE" ]]; then
+  require_private_file "$MYSQL_DEFAULTS_FILE"
+fi
+if [[ -n "$AWS_CA_BUNDLE" ]]; then
+  require_file "$AWS_CA_BUNDLE"
+fi
+
+[[ "$BOOKSTACK_ROOT" == /* && "$STAGING_ROOT" == /* && "$LOCK_FILE" == /* ]] || fatal "Application, staging, and lock paths must be absolute"
+BOOKSTACK_ROOT="$(realpath -e -- "$BOOKSTACK_ROOT")"
+STAGING_ROOT="$(realpath -m -- "$STAGING_ROOT")"
+LOCK_FILE="$(realpath -m -- "$LOCK_FILE")"
+[[ "$STAGING_ROOT" != / ]] || fatal "STAGING_ROOT cannot be the filesystem root"
+case "$STAGING_ROOT/" in
+  "$BOOKSTACK_ROOT/"*) fatal "Staging must be outside the application tree" ;;
+esac
+case "$LOCK_FILE" in
+  "$STAGING_ROOT/"*) fatal "LOCK_FILE must be outside STAGING_ROOT" ;;
+esac
+
+mkdir -p -m 0700 -- "$STAGING_ROOT" "$(dirname "$LOCK_FILE")"
+for private_directory in "$STAGING_ROOT" "$(dirname "$LOCK_FILE")"; do
+  read -r directory_owner directory_mode < <(stat -c '%u %a' -- "$private_directory")
+  [[ "$directory_owner" == "$EUID" ]] && (( (8#$directory_mode & 077) == 0 )) || fatal "State/runtime directories must belong to the executing user and be private"
+done
+exec 9>"$LOCK_FILE"
+flock -n 9 || fatal "Another backup or preflight process holds $LOCK_FILE"
+
+# Do not delete failed evidence automatically or accumulate repeated failures.
+[[ -z "$(find "$STAGING_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]] || fatal "Staging contains retained data; review it before another run"
+
+# A native per-file ceiling also bounds a runaway dump/archiver. It is not a
+# directory quota; source growth still requires free-space checks below.
+ulimit -f "$((MAX_STAGING_MIB * 1024))"
+
+mysql_command=(mysql)
+mysqldump_command=(mysqldump)
+if [[ -n "$MYSQL_DEFAULTS_FILE" ]]; then
+  # MySQL requires --defaults-extra-file to be the first option.
+  mysql_command+=("--defaults-extra-file=$MYSQL_DEFAULTS_FILE")
+  mysqldump_command+=("--defaults-extra-file=$MYSQL_DEFAULTS_FILE")
+fi
+
+mysql_scalar() {
+  run_bounded "$MYSQL_QUERY_TIMEOUT_SECONDS" "${mysql_command[@]}" \
+    --connect-timeout=5 --database="$DB_NAME" --batch --skip-column-names \
+    --execute "SET SESSION max_execution_time=3000; SET SESSION lock_wait_timeout=3; $1" \
+    || fatal "Database metadata query failed or timed out"
+}
+
+log "Checking database access and inventory"
+# Selecting the database on connection rejects a missing schema. Reuse
+# DATABASE() in every filter to avoid inconsistent schema names.
+db_server_version="$(mysql_scalar 'SELECT VERSION();')"
+base_table_count="$(mysql_scalar "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_type='BASE TABLE';")"
+[[ "$base_table_count" =~ ^[0-9]+$ ]] && (( base_table_count > 0 )) || fatal "Database has no visible base tables; refusing an empty or inaccessible schema"
+db_size_mib="$(mysql_scalar "SELECT COALESCE(CEIL(SUM(data_length + index_length) / 1024 / 1024), 0) FROM information_schema.tables WHERE table_schema=DATABASE();")"
+non_innodb_count="$(mysql_scalar "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_type='BASE TABLE' AND COALESCE(engine, '') <> 'InnoDB';")"
+db_default_collation="$(mysql_scalar "SELECT COALESCE(default_collation_name, '') FROM information_schema.schemata WHERE schema_name=DATABASE();")"
+
+[[ "$db_size_mib" =~ ^[0-9]+$ ]] || fatal "Could not determine database size"
+[[ "$non_innodb_count" =~ ^[0-9]+$ ]] || fatal "Could not determine non-InnoDB table count"
+[[ "$db_default_collation" =~ ^[A-Za-z0-9_]+$ ]] || fatal "Could not determine database collation"
+if (( non_innodb_count > 0 )); then
+  fatal "Database contains $non_innodb_count non-InnoDB base table(s); refusing transactional backup"
+fi
+
+# du reads filesystem metadata, not file contents. Fail closed on unexpected
+# top-level symlinks until their external recovery paths have been reviewed.
+for source_path in .env public/uploads storage/uploads themes; do
+  [[ ! -L "$BOOKSTACK_ROOT/$source_path" ]] || fatal "Recovery path is a symlink and needs review: $source_path"
+done
+source_kib="$(run_bounded "$FILE_TIMEOUT_SECONDS" du -sk --apparent-size -- \
+  "$BOOKSTACK_ROOT/.env" "$BOOKSTACK_ROOT/public/uploads" \
+  "$BOOKSTACK_ROOT/storage/uploads" "$BOOKSTACK_ROOT/themes" | awk '{total += $1} END {printf "%.0f", total}')"
+[[ "$source_kib" =~ ^[0-9]+$ ]] || fatal "Could not estimate source file size"
+source_mib=$(((source_kib + 1023) / 1024))
+estimated_staging_mib=$((db_size_mib * 2 + source_mib * 2 + 64))
+(( estimated_staging_mib <= MAX_STAGING_MIB )) || fatal "Estimated staging ${estimated_staging_mib} MiB exceeds MAX_STAGING_MIB=${MAX_STAGING_MIB}; review capacity before increasing it"
+
+check_staging_space() {
+  local additional_mib="$1" available_kib available_mib staged_kib
+  available_kib="$(df -Pk "$STAGING_ROOT" | awk 'NR == 2 {print $4}')"
+  [[ "$available_kib" =~ ^[0-9]+$ ]] || fatal "Could not determine free staging space"
+  available_mib=$((available_kib / 1024))
+  (( available_mib >= MIN_FREE_MIB + additional_mib )) || fatal "Insufficient staging space: ${available_mib} MiB available; reserve ${MIN_FREE_MIB} MiB plus ${additional_mib} MiB required"
+  staged_kib="$(run_bounded "$FILE_TIMEOUT_SECONDS" du -sk -- "$STAGING_ROOT" | awk '{print $1}')"
+  [[ "$staged_kib" =~ ^[0-9]+$ ]] || fatal "Could not determine staging usage"
+  (( staged_kib <= MAX_STAGING_MIB * 1024 )) || fatal "Staging exceeded MAX_STAGING_MIB=${MAX_STAGING_MIB}"
+}
+# ponytail: phase-boundary checks are not an atomic directory byte quota;
+# use a dedicated quota/filesystem if source growth demands a hard total cap.
+check_staging_space "$estimated_staging_mib"
+
+# Do not accidentally use a more privileged credential inherited by the caller.
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
+export AWS_EC2_METADATA_DISABLED=true AWS_PAGER="" AWS_MAX_ATTEMPTS=2 AWS_RETRY_MODE=standard
+if [[ -n "$AWS_CA_BUNDLE" ]]; then
+  export AWS_CA_BUNDLE
+fi
+
+aws_command=(aws --endpoint-url "$S3_ENDPOINT_URL" --cli-connect-timeout 5 --cli-read-timeout 30)
+s3_command() {
+  run_bounded "$S3_TIMEOUT_SECONDS" "${aws_command[@]}" "$@"
+}
+log "Checking Garage/S3 bucket access"
+s3_command s3api head-bucket --bucket "$S3_BUCKET" >/dev/null
+log "Validating encryption recipients with empty input"
+run_bounded "$FILE_TIMEOUT_SECONDS" age --encrypt --recipients-file "$AGE_RECIPIENT_FILE" </dev/null >/dev/null
+
+bookstack_version="$(tr -d '\r\n' < "$BOOKSTACK_ROOT/version")"
+mysqldump_version="$(mysqldump --version | head -n 1)"
+log "Preflight inventory: BookStack=$bookstack_version DB=$db_server_version DB-size=${db_size_mib}MiB tables=$base_table_count non-InnoDB=$non_innodb_count collation=$db_default_collation source-files=${source_mib}MiB estimated-staging=${estimated_staging_mib}MiB"
+
+if [[ "$MODE" == "preflight" ]]; then
+  log "Preflight completed successfully; no backup was created or uploaded"
+  exit 0
+fi
+
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+random_id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+backup_id="${timestamp}-${random_id}"
+year="${timestamp:0:4}"
+month="${timestamp:4:2}"
+day="${timestamp:6:2}"
+remote_prefix="${S3_PREFIX}/${year}/${month}/${day}/${backup_id}"
+workdir="$(mktemp -d "$STAGING_ROOT/${backup_id}.XXXXXX")"
+files_stage="$workdir/files"
+mkdir -m 0700 "$files_stage"
+backup_succeeded=false
+publication_attempted=false
+
+cleanup() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ "$backup_succeeded" == true ]]; then
+    rm -rf -- "$workdir"
+  else
+    if [[ "$publication_attempted" == true ]]; then
+      log "WARNING: completion publication was attempted; inspect the remote prefix before assuming it is incomplete"
+    fi
+    if is_true "$KEEP_FAILED_STAGING"; then
+      log "Backup failed (exit $exit_code); protected staging retained at $workdir; further runs will refuse until reviewed"
+    else
+      rm -rf -- "$workdir"
+    fi
+  fi
+  exit "$exit_code"
+}
+trap cleanup EXIT
+trap 'log "ERROR: operation failed (exit $?) at line $LINENO"' ERR
+trap 'fatal "Interrupted by signal"' INT TERM HUP
+
+copy_file_trees() {
+  local relative_path
+  for relative_path in public/uploads storage/uploads themes; do
+    run_bounded "$FILE_TIMEOUT_SECONDS" rsync -a --relative -- "$BOOKSTACK_ROOT/./$relative_path/" "$files_stage/"
+  done
+}
+
+log "Starting online recovery set $backup_id"
+log "Pre-staging BookStack file trees"
+copy_file_trees
+check_staging_space "$((db_size_mib * 2 + source_mib + 64))"
+
+mysqldump_args=(
+  --single-transaction
+  --quick
+  --skip-lock-tables
+  --default-character-set=utf8mb4
+  --hex-blob
+  --triggers
+  --routines
+  --events
+)
+mysqldump_help="$(run_bounded "$MYSQL_QUERY_TIMEOUT_SECONDS" mysqldump --help 2>/dev/null)"
+if grep -q -- '--set-gtid-purged' <<<"$mysqldump_help"; then
+  mysqldump_args+=(--set-gtid-purged=OFF)
+fi
+if grep -q -- '--column-statistics' <<<"$mysqldump_help"; then
+  mysqldump_args+=(--column-statistics=0)
+fi
+if grep -q -- '--no-tablespaces' <<<"$mysqldump_help"; then
+  mysqldump_args+=(--no-tablespaces)
+fi
+unset mysqldump_help
+
+log "Creating transactional database dump and encrypting it"
+run_bounded "$DUMP_TIMEOUT_SECONDS" "${mysqldump_command[@]}" "${mysqldump_args[@]}" "$DB_NAME" \
+  | run_bounded "$DUMP_TIMEOUT_SECONDS" gzip -n -1 \
+  | run_bounded "$DUMP_TIMEOUT_SECONDS" age --encrypt --recipients-file "$AGE_RECIPIENT_FILE" --output "$workdir/database.sql.gz.age"
+check_staging_space "$((source_mib * 2 + 64))"
+
+log "Post-staging BookStack file trees without deleting the pre-staged copy"
+copy_file_trees
+cp --preserve=mode,timestamps -- "$BOOKSTACK_ROOT/.env" "$files_stage/.env"
+chmod 0600 "$files_stage/.env"
+check_staging_space "$((source_mib + 64))"
+
+log "Archiving and encrypting BookStack files"
+run_bounded "$FILE_TIMEOUT_SECONDS" tar -C "$files_stage" -cf - . \
+  | run_bounded "$FILE_TIMEOUT_SECONDS" gzip -n -1 \
+  | run_bounded "$FILE_TIMEOUT_SECONDS" age --encrypt --recipients-file "$AGE_RECIPIENT_FILE" --output "$workdir/bookstack-files.tar.gz.age"
+check_staging_space 0
+
+rm -rf -- "$files_stage"
+
+database_encrypted_size="$(stat -c %s "$workdir/database.sql.gz.age")"
+files_encrypted_size="$(stat -c %s "$workdir/bookstack-files.tar.gz.age")"
+packaged_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+source_hostname="$(hostname --fqdn 2>/dev/null || hostname)"
+
+export META_PATH="$workdir/metadata.json"
+export META_BACKUP_ID="$backup_id" META_STARTED_AT="$started_at" META_PACKAGED_AT="$packaged_at"
+export META_HOSTNAME="$source_hostname" META_APP_URL="$SOURCE_APP_URL" META_BOOKSTACK_VERSION="$bookstack_version"
+export META_DB_VERSION="$db_server_version" META_MYSQLDUMP_VERSION="$mysqldump_version"
+export META_DB_SIZE_MIB="$db_size_mib" META_DB_COLLATION="$db_default_collation"
+export META_DB_ENCRYPTED_SIZE="$database_encrypted_size" META_FILES_ENCRYPTED_SIZE="$files_encrypted_size"
+export META_SCRIPT_VERSION="$SCRIPT_VERSION"
+python3 <<'PY'
+import json
+import os
+
+payload = {
+    "format_version": 1,
+    "backup_id": os.environ["META_BACKUP_ID"],
+    "started_at_utc": os.environ["META_STARTED_AT"],
+    "packaged_at_utc": os.environ["META_PACKAGED_AT"],
+    "source_hostname": os.environ["META_HOSTNAME"],
+    "source_app_url": os.environ["META_APP_URL"],
+    "bookstack_version": os.environ["META_BOOKSTACK_VERSION"],
+    "database_family": "mysql",
+    "database_server_version": os.environ["META_DB_VERSION"],
+    "mysqldump_version": os.environ["META_MYSQLDUMP_VERSION"],
+    "database_size_mib": int(os.environ["META_DB_SIZE_MIB"]),
+    "database_default_collation": os.environ["META_DB_COLLATION"],
+    "consistency_mode": "online-best-effort-two-pass-files",
+    "script_version": os.environ["META_SCRIPT_VERSION"],
+    "database_encrypted_size_bytes": int(os.environ["META_DB_ENCRYPTED_SIZE"]),
+    "files_encrypted_size_bytes": int(os.environ["META_FILES_ENCRYPTED_SIZE"]),
+}
+with open(os.environ["META_PATH"], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+unset META_PATH META_BACKUP_ID META_STARTED_AT META_PACKAGED_AT META_HOSTNAME META_APP_URL
+unset META_BOOKSTACK_VERSION META_DB_VERSION META_MYSQLDUMP_VERSION META_DB_SIZE_MIB META_DB_COLLATION
+unset META_DB_ENCRYPTED_SIZE META_FILES_ENCRYPTED_SIZE META_SCRIPT_VERSION
+
+(
+  cd "$workdir"
+  sha256sum database.sql.gz.age bookstack-files.tar.gz.age metadata.json > checksums.sha256
+)
+
+verify_remote_size() {
+  local local_path="$1"
+  local object_key="$2"
+  local expected_size actual_size
+  if ! is_true "$VERIFY_REMOTE_SIZE"; then
+    return 0
+  fi
+  expected_size="$(stat -c %s "$local_path")"
+  actual_size="$(s3_command s3api head-object \
+    --bucket "$S3_BUCKET" \
+    --key "$object_key" \
+    --query ContentLength \
+    --output text)"
+  [[ "$actual_size" == "$expected_size" ]] || fatal "Remote size mismatch for $object_key: expected $expected_size, got $actual_size"
+}
+
+upload_file() {
+  local local_path="$1"
+  local filename="${2:-$(basename "$local_path")}"
+  local object_key="${remote_prefix}/${filename}"
+  log "Uploading $filename"
+  check_staging_space 0
+  if [[ "$filename" == COMPLETE.json ]]; then
+    publication_attempted=true
+  fi
+  s3_command s3 cp --only-show-errors --no-progress \
+    "$local_path" "s3://${S3_BUCKET}/${object_key}"
+  verify_remote_size "$local_path" "$object_key"
+}
+
+upload_file "$workdir/database.sql.gz.age"
+upload_file "$workdir/bookstack-files.tar.gz.age"
+upload_file "$workdir/metadata.json"
+upload_file "$workdir/checksums.sha256"
+
+checksums_sha256="$(sha256sum "$workdir/checksums.sha256" | awk '{print $1}')"
+completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export COMPLETE_PATH="$workdir/COMPLETE.json" COMPLETE_BACKUP_ID="$backup_id"
+export COMPLETE_TIME="$completed_at" COMPLETE_CHECKSUMS_SHA256="$checksums_sha256"
+python3 <<'PY'
+import json
+import os
+
+payload = {
+    "format_version": 1,
+    "backup_id": os.environ["COMPLETE_BACKUP_ID"],
+    "completed_at_utc": os.environ["COMPLETE_TIME"],
+    "checksums_sha256": os.environ["COMPLETE_CHECKSUMS_SHA256"],
+    "objects": [
+        "database.sql.gz.age",
+        "bookstack-files.tar.gz.age",
+        "metadata.json",
+        "checksums.sha256",
+    ],
+}
+with open(os.environ["COMPLETE_PATH"], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+unset COMPLETE_PATH COMPLETE_BACKUP_ID COMPLETE_TIME COMPLETE_CHECKSUMS_SHA256
+
+# COMPLETE.json is intentionally published last. Consumers must ignore prefixes
+# without this marker.
+upload_file "$workdir/COMPLETE.json"
+
+backup_succeeded=true
+log "Backup completed successfully: s3://${S3_BUCKET}/${remote_prefix}/"

@@ -1,24 +1,48 @@
-# Reviewed AWS CLI installer
+# Reviewed client setup tools
 
-This folder contains one action: install **AWS CLI 2.40.3 on Linux x86_64**.
-It does not configure credentials, upload data, install packages, enable schedules,
-change services or reboot. No Git is needed on the target machine.
+Three separate, deliberate actions are provided:
 
-## Publish only these files
+- `01-install-aws-cli.sh`: install **AWS CLI 2.40.3 on Linux x86_64** only.
+- `02-configure-backup.sh`: **setup only**, write private configuration and install
+  the reviewed local runtime and systemd service, then `daemon-reload` only.
+- `03-check-garage-access.sh`: **HeadBucket only**, check terminal-entered S3
+  credentials/basic bucket access without saving credentials or reading `02` config.
 
-Create a **separate, clean public repository**, with only `01-install-aws-cli.sh`,
-`SHA256SUMS` and this `README.md` at its root. Copy these three files only.
-Do not publish the source repository, its history, other documentation, tests,
-configuration, logs or machine-specific information. Review the public files
-before publishing. Record the full reviewed commit ID and share the installer's
-expected SHA-256 over an independently trusted channel.
+None of these helpers starts/enables a backup, installs a timer, runs preflight, dumps,
+archives or uploads application data, reboots or restarts services. No Git is
+needed on the target machine. Publishing/downloading these files does nothing
+until an operator deliberately executes a helper.
 
-`SHA256SUMS` covers the installer. A manifest fetched from the same URL is a
-convenience check, **not independent authentication**. Use both the full reviewed
-commit URL and the trusted expected hash. Never use a moving branch URL or
-`curl | bash`.
+## Publish only this public working tree
 
-## Before running
+Publish the **whole reviewed working tree of this folder, excluding `.git`**, to
+its separate clean public repository. Its exact file list is:
+
+```text
+01-install-aws-cli.sh
+02-configure-backup.sh
+03-check-garage-access.sh
+README.md
+SHA256SUMS
+lib/bookstack-dr-backup
+lib/bookstack-dr-backup.service
+```
+
+Do not publish the private parent project, its history, documentation, tests,
+configuration, identities, logs or machine-specific information. Keep all private
+values on the client VM or in approved private handoff records, never in this
+public tree. Review every public file before publication. Record the **full
+reviewed public commit ID** and share each helper's expected SHA-256 over an
+independently trusted channel.
+
+`SHA256SUMS` covers the helpers, README and payloads. A manifest fetched from the
+same URL is a convenience check, **not independent authentication**. Establish
+initial trust in `02` with its independently supplied hash and full reviewed
+commit; it embeds hashes of both local payloads and checks the exact snapshots it
+will install. There are no remote payload downloads or fallback paths. Never
+use a moving branch URL or `curl | bash`.
+
+## 01 — Before running (dependency installation only)
 
 Confirm the authorized machine and installation scope. Check its clock, current
 load, memory, staging and `/usr/local` free space; allow for the archive, extracted
@@ -34,7 +58,7 @@ installer does not install prerequisites. It stops if either AWS command or any
 fixed installation destination already exists, including dangling symlinks.
 There is no update/overwrite mode.
 
-## Download, verify, run as a normal user
+## 01 — Download, verify, run as a normal user
 
 Replace `OWNER`, `REPO`, `FULL_COMMIT` and `TRUSTED_SHA256` below with the reviewed
 public location and independently supplied hash. The repository URL is not yet
@@ -86,3 +110,152 @@ is subject to the machine's cleanup policy.
 Review logs locally and redact before sending output back through an approved
 private channel. **Never upload logs or machine output to the public repository.**
 Publishing and mocked tests do not establish a live installation result.
+
+## 02 — Download the complete reviewed release, verify, run as root
+
+Do not rerun `01` if the dependency is already installed and accepted. Missing
+prerequisites for `02` are a stop condition, not permission to install packages.
+
+Download/extract the **whole snapshot at the full reviewed public commit** into
+a new local directory (for example, download the archive from
+`https://github.com/OWNER/REPO/archive/FULL_COMMIT.zip`). Preserve `lib/` alongside
+`02-configure-backup.sh`; a lone script download is insufficient. Alternatively,
+an existing checkout of the separate public repository can be updated locally by
+the operator, reviewed and checked out at that exact full commit. The helper
+never fetches, pulls, updates itself or downloads missing assets. Do not use the
+private parent project's checkout as the client distribution.
+
+After checking the independently supplied full commit and `TRUSTED_02_SHA256`,
+run these commands in the extracted public folder. Replace the hash placeholder
+with the independently trusted value; never take it only from the same download.
+
+```bash
+printf '%s  02-configure-backup.sh\n' 'TRUSTED_02_SHA256' | sha256sum --check --strict -
+sha256sum --check --strict SHA256SUMS
+bash ./02-configure-backup.sh --help
+sudo bash ./02-configure-backup.sh
+```
+
+Unlike `01`, **only `02` is run as authorized root via sudo**. Use an interactive
+TTY. Do not pipe inputs, pass credentials as arguments/environment, redirect a
+secret-input session to a log, share terminal recordings, or screenshot private
+keys. Xtrace and terminal echo are disabled before input. No values are printed
+back. Never enter an age private identity, BookStack `APP_KEY` or database
+password. The application `.env` is neither read nor changed during setup.
+
+Prepare these reviewed values through the approved private handoff; none has a
+blind default. Prompts appear in this exact order (all input is hidden):
+
+1. `Source APP_URL (reviewed HTTPS URL)`
+2. `S3 endpoint (reviewed HTTPS URL)`
+3. `S3 bucket (reviewed exact name)`
+4. `S3 region (reviewed exact value)`
+5. `S3 prefix (reviewed lifecycle-matching value, no leading/trailing slash)`
+6. `age PUBLIC recipient (age1...)`
+7. `S3 access key ID (hidden)`
+8. `S3 secret access key (hidden)`
+9. `Type INSTALL SETUP ONLY to authorize these writes`
+
+Use HTTPS URLs without embedded authentication, query, fragment, escapes or
+control characters. Bucket names must be lowercase DNS-style, regions use
+letters/digits/underscore/hyphen, and prefixes use nonempty slash-separated
+letters/digits/underscore/hyphen segments. Only native `age1` public recipients
+are accepted and checked locally by encrypting **empty input** to `/dev/null`;
+this does not prove identity custody or decryptability. S3 keys must be single-line
+letters/digits or `/+=._-`; unsupported formats are a stop for private review,
+not a reason to bypass validation. No endpoint, credential, database, application
+or lifecycle availability check runs in this helper.
+
+Before confirmation, local assets, field formats and destination safety are
+checked. Existing destinations, symlinks, unsafe parents, and already installed
+units/overrides are refused; no overwrite/update/force option exists. After exact
+confirmation it creates only these fixed root-owned targets:
+
+```text
+/etc/bookstack-dr-backup/                          0700
+    config, aws-config, aws-credentials,
+    age-recipient.txt                             0600
+/var/lib/bookstack-dr-backup/                      0700
+/var/lib/bookstack-dr-backup/staging/              0700
+/run/bookstack-dr-backup/                          0700
+/usr/local/sbin/bookstack-dr-backup                0755
+/etc/systemd/system/bookstack-dr-backup.service    0644
+```
+
+Parent directories must already exist, be root-owned and not group/other
+writable. Nothing unrelated is overwritten or chmodded. The AWS profile is
+`bookstack-backup`, with path-style SigV4, two concurrent requests and 1 MB/s
+transfer limit. Runtime defaults retain `/var/www/bookstack`, database `bookstack`,
+local root MySQL socket authentication (no DB password), 512 MiB staging budget,
+2 GiB reserve and the existing conservative service limits. Review those paths
+and limits before setup; they are not discovered from the application's `.env`.
+The runtime and service are installed byte-for-byte as reviewed. The helper does
+not execute the installed runtime. Only `systemctl daemon-reload` changes manager
+state; the unit is not started or enabled and no timer is installed.
+
+**Stop on setup failure.** Failure retains any partial root state/evidence for private
+review; do not retry blindly or delete it automatically. Success is not readiness
+for backup. Before a separately approved service run, confirm a dummy
+decrypt with the **vault-retrieved private identity off production**, scoped S3
+credential readiness, exact prefix coverage by the reviewed five-day lifecycle
+(do not assume it is applied), permissions/capacity and application/service
+health. No real backup, restore, timer, monitoring or availability result is
+established by setup or by local mocked tests. Logs/output belong only in approved
+private channels, never the public repository.
+
+## 03 — After successful setup and verified artifacts
+
+From the complete reviewed release, verify `03` with its independently supplied
+SHA-256 (and the release manifest) before executing it. Run as a **normal user**,
+not sudo. Requires Bash, AWS CLI and `timeout`; missing tools mean stop, not
+installation. Supply exactly three nonsecret arguments: **ENDPOINT REGION BUCKET**,
+using reviewed private handoff values. Only arity and the `https://` scheme are
+checked locally; AWS CLI handles syntax validation.
+
+The S3 access ID and secret are the only prompts (**both hidden**); neither may
+be empty. Never supply credentials as arguments/environment, record the session,
+or enter a private identity, `APP_KEY` or database password. Credentials stay in
+the subprocess; session tokens/profiles are unset and AWS config/credentials
+paths are `/dev/null`. Nothing is saved. Only `s3api head-bucket` runs, with
+5-second connect/10-second read timeouts, one attempt, metadata disabled and a
+30-second timeout plus 5-second kill grace. Normal SDK errors remain visible
+(no debug); keep output private. Any failure returns nonzero: stop for review.
+
+After `02` succeeds and artifacts are verified, run in this order, **stopping if
+either command fails** (do not paste/run subsequent steps after failure):
+
+```bash
+bash 03-check-garage-access.sh https://storage.example.invalid test-region example-backup-bucket
+```
+
+Only after `03` succeeds:
+
+```bash
+sudo /usr/local/sbin/bookstack-dr-backup --preflight
+```
+
+`03` checks the **entered credentials/basic bucket access only**. It does not
+prove PUT permission or validate the configuration saved by `02`. Preflight
+checks the **actual saved configuration**, including bucket access, local
+permissions/capacity, bounded DB/source metadata and empty-input encryption;
+it does not upload or prove PUT permission either. Neither establishes backup
+readiness alone. Stop for private review on any failure; never bypass checks.
+
+Only after both succeed **and** vault-retrieved dummy decryption off production,
+current application/service health and all credential/lifecycle/readiness gates
+are confirmed, obtain **explicit pilot approval** for ONE supervised invocation:
+
+```bash
+sudo systemctl start --no-block bookstack-dr-backup.service
+sudo journalctl -u bookstack-dr-backup.service -n 80 --no-pager
+systemctl show bookstack-dr-backup.service -p ActiveState -p SubState -p Result -p ExecMainStatus
+```
+
+The start returns before the oneshot finishes. Check logs/state again after it
+finishes: expect `ActiveState=inactive`, `SubState=dead`, `Result=success` and
+`ExecMainStatus=0`. Success/0 before completion is not a completed backup result.
+Keep the timer **uninstalled/disabled**. Observe BookStack responsiveness and
+resources throughout; only if degradation occurs under the approved pilot stop
+scope, manually stop **only the backup service** with
+`sudo systemctl stop bookstack-dr-backup.service`. Do not stop/restart application,
+database or security services, retry automatically or delete failed evidence.
