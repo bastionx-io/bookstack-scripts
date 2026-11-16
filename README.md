@@ -5,7 +5,7 @@ Three separate, deliberate actions are provided:
 - `01-install-aws-cli.sh`: install **AWS CLI 2.40.3 on Linux x86_64** only.
 - `02-configure-backup.sh`: **setup only**, write private configuration and install
   the reviewed local runtime and systemd service, then `daemon-reload` only.
-- `03-check-garage-access.sh`: **HeadBucket only**, check terminal-entered S3
+- `03-check-garage-access.sh`: **HeadBucket only**, check exported S3
   credentials/basic bucket access without saving credentials or reading `02` config.
 
 None of these helpers starts/enables a backup, installs a timer, runs preflight, dumps,
@@ -133,18 +133,29 @@ with the independently trusted value; never take it only from the same download.
 printf '%s  02-configure-backup.sh\n' 'TRUSTED_02_SHA256' | sha256sum --check --strict -
 sha256sum --check --strict SHA256SUMS
 bash ./02-configure-backup.sh --help
-sudo bash ./02-configure-backup.sh
+set +x
+source "$HOME/.config/bookstack-dr-backup/session.env.sh"
+sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY bash 02-configure-backup.sh
 ```
 
 Unlike `01`, **only `02` is run as authorized root via sudo**. Use an interactive
-TTY. Do not pipe inputs, pass credentials as arguments/environment, redirect a
-secret-input session to a log, share terminal recordings, or screenshot private
-keys. Xtrace and terminal echo are disabled before input. No values are printed
+TTY. Source only a trusted, private file outside the public clone, containing the
+exported `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; both must be nonempty.
+Keep that file mode 0600 and its parent directory private (0700). Never source an
+untrusted script. Disable shell tracing before sourcing; never type credentials
+inline in commands/history. Environment credentials remain visible to root and
+potentially same-UID processes; this is not zero exposure. Changing this environment
+does **not** rotate an already configured root credential file: `02` still refuses
+existing targets; updating persisted credentials needs a separate approved change.
+Do not pipe inputs, pass credentials as arguments, redirect the input session to a
+log, share terminal recordings, or screenshot private keys. Xtrace and terminal
+echo are disabled before helper input. No values are printed
 back. Never enter an age private identity, BookStack `APP_KEY` or database
 password. The application `.env` is neither read nor changed during setup.
 
 Prepare these reviewed values through the approved private handoff; none has a
-blind default. Prompts appear in this exact order (all input is hidden):
+blind default. Credentials come only from the exported pair, not prompts.
+Prompts appear in this exact order (all input is hidden):
 
 1. `Source APP_URL (reviewed HTTPS URL)`
 2. `S3 endpoint (reviewed HTTPS URL)`
@@ -152,9 +163,7 @@ blind default. Prompts appear in this exact order (all input is hidden):
 4. `S3 region (reviewed exact value)`
 5. `S3 prefix (reviewed lifecycle-matching value, no leading/trailing slash)`
 6. `age PUBLIC recipient (age1...)`
-7. `S3 access key ID (hidden)`
-8. `S3 secret access key (hidden)`
-9. `Type INSTALL SETUP ONLY to authorize these writes`
+7. `Type INSTALL SETUP ONLY to authorize these writes`
 
 Use HTTPS URLs without embedded authentication, query, fragment, escapes or
 control characters. Bucket names must be lowercase DNS-style, regions use
@@ -212,9 +221,10 @@ installation. Supply exactly three nonsecret arguments: **ENDPOINT REGION BUCKET
 using reviewed private handoff values. Only arity and the `https://` scheme are
 checked locally; AWS CLI handles syntax validation.
 
-The S3 access ID and secret are the only prompts (**both hidden**); neither may
-be empty. Never supply credentials as arguments/environment, record the session,
-or enter a private identity, `APP_KEY` or database password. Credentials stay in
+There are no credential prompts: both exported `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` must be nonempty, sourced from the trusted private file
+as above. Never supply credentials as arguments, record the session, or enter a
+private identity, `APP_KEY` or database password. Credentials stay in
 the subprocess; session tokens/profiles are unset and AWS config/credentials
 paths are `/dev/null`. Nothing is saved. Only `s3api head-bucket` runs, with
 5-second connect/10-second read timeouts, one attempt, metadata disabled and a
@@ -234,7 +244,7 @@ Only after `03` succeeds:
 sudo /usr/local/sbin/bookstack-dr-backup --preflight
 ```
 
-`03` checks the **entered credentials/basic bucket access only**. It does not
+`03` checks the **exported credentials/basic bucket access only**. It does not
 prove PUT permission or validate the configuration saved by `02`. Preflight
 checks the **actual saved configuration**, including bucket access, local
 permissions/capacity, bounded DB/source metadata and empty-input encryption;

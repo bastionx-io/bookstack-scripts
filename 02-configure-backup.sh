@@ -3,6 +3,9 @@
 set +x
 set +a
 unset source_url endpoint bucket region prefix recipient access_key secret_key confirmation
+access_key="${AWS_ACCESS_KEY_ID:-}"
+secret_key="${AWS_SECRET_ACCESS_KEY:-}"
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 set -Eeuo pipefail
 umask 077
 set -o noclobber
@@ -14,8 +17,9 @@ Setup only; run deliberately as authorized root on the client VM, from a TTY.
 Requires local lib/bookstack-dr-backup and lib/bookstack-dr-backup.service,
 age, python3, systemctl and standard Linux utilities; installs no dependencies.
 Prompts for reviewed source APP_URL, S3 HTTPS endpoint, bucket, region, prefix,
-age PUBLIC recipient, and S3 access/secret keys. No defaults for these inputs.
-Credentials are read silently from the terminal, never arguments/environment.
+age PUBLIC recipient. No defaults for these inputs. Credentials require both
+exported AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (nonempty); never secret args.
+For env reuse: sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY bash 02-configure-backup.sh
 Never enter a private identity, APP_KEY or database password. Do not share secret
 input, terminal recordings, or screenshots of private keys.
 Writes only protected configuration/state/runtime directories, runtime and unit;
@@ -29,7 +33,8 @@ EOF
 fi
 fatal() { printf '%s\n' "$*; stop for review (no automatic cleanup)." >&2; exit 1; }
 (( $# == 0 )) || fatal 'Unexpected arguments; use --help'
-[[ "$(id -u)" == 0 ]] || fatal 'Run only as authorized root: sudo bash 02-configure-backup.sh'
+[[ -n "$access_key" && -n "$secret_key" ]] || fatal 'Both exported AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be nonempty'
+[[ "$(id -u)" == 0 ]] || fatal 'Run only as authorized root: sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY bash 02-configure-backup.sh'
 [[ -t 0 && -t 1 ]] || fatal 'Interactive terminal required; do not pipe inputs or log the session'
 exec 3<>/dev/tty
 trap 'printf "Setup failed; retain partial state for private review. No job was started.\n" >&2' ERR
@@ -96,8 +101,6 @@ read_field bucket 'S3 bucket (reviewed exact name)'
 read_field region 'S3 region (reviewed exact value)'
 read_field prefix 'S3 prefix (reviewed lifecycle-matching value, no leading/trailing slash)'
 read_field recipient 'age PUBLIC recipient (age1...)'
-read_field access_key 'S3 access key ID (hidden)'
-read_field secret_key 'S3 secret access key (hidden)'
 
 # Values go over stdin, not process arguments or environment. No network calls.
 if ! printf '%s\n' "$source_url" "$endpoint" "$bucket" "$region" "$prefix" "$recipient" "$access_key" "$secret_key" | python3 -c '
@@ -142,6 +145,7 @@ valid = valid and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", region))
 valid = valid and len(prefix) <= 512 and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)*", prefix))
 valid = valid and bool(re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", recipient))
 valid = valid and all(re.fullmatch(r"[A-Za-z0-9/+=._-]{1,256}", key) for key in (access, secret))
+valid = valid and all("AGE-SECRET" not in key and not re.search("PRIVATE.*KEY", key) for key in (access, secret))
 sys.exit(0 if valid else 1)
 '; then
   fatal 'Invalid input format (values withheld)'

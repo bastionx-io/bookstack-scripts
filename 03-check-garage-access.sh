@@ -3,26 +3,19 @@
 set +x
 set +a
 unset access_key secret_key
+access_key="${AWS_ACCESS_KEY_ID:-}"
+secret_key="${AWS_SECRET_ACCESS_KEY:-}"
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 if [[ $# == 1 && "$1" == --help ]]; then
-  printf '%s\n' 'Usage: bash 03-check-garage-access.sh ENDPOINT REGION BUCKET' 'HeadBucket only; prompts for both credentials (hidden).'
+  printf '%s\n' 'Usage: bash 03-check-garage-access.sh ENDPOINT REGION BUCKET' 'HeadBucket only; requires exported AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.'
   exit 0
 fi
 if [[ $# != 3 || "${1:-}" != https://* ]]; then
   printf '%s\n' 'Usage: bash 03-check-garage-access.sh ENDPOINT REGION BUCKET (HTTPS required)' >&2
   exit 1
 fi
-if ! IFS= read -rsp 'S3 access key ID (hidden): ' access_key; then
-  printf '\nCredential input failed.\n' >&2
-  exit 1
-fi
-printf '\n'
-if ! IFS= read -rsp 'S3 secret access key (hidden): ' secret_key; then
-  printf '\nCredential input failed.\n' >&2
-  exit 1
-fi
-printf '\n'
 if [[ -z "$access_key" || -z "$secret_key" ]]; then
-  printf '%s\n' 'Both credentials must be nonempty.' >&2
+  printf '%s\n' 'Both exported AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be nonempty.' >&2
   exit 1
 fi
 unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE
