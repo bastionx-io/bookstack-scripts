@@ -26,6 +26,7 @@ README.md
 SHA256SUMS
 lib/bookstack-dr-backup
 lib/bookstack-dr-backup.service
+lib/bookstack-dr-backup.timer
 ```
 
 Do not publish the private parent project, its history, documentation, tests,
@@ -265,8 +266,27 @@ systemctl show bookstack-dr-backup.service -p ActiveState -p SubState -p Result 
 The start returns before the oneshot finishes. Check logs/state again after it
 finishes: expect `ActiveState=inactive`, `SubState=dead`, `Result=success` and
 `ExecMainStatus=0`. Success/0 before completion is not a completed backup result.
-Keep the timer **uninstalled/disabled**. Observe BookStack responsiveness and
+During the pilot, keep the timer **uninstalled/disabled**. Observe BookStack responsiveness and
 resources throughout; only if degradation occurs under the approved pilot stop
 scope, manually stop **only the backup service** with
 `sudo systemctl stop bookstack-dr-backup.service`. Do not stop/restart application,
 database or security services, retry automatically or delete failed evidence.
+
+## Optional daily timer — after a successful pilot
+
+The timer runs the existing service daily at **03:00 in the VM’s local time**.
+Missed runs are not caught up at startup. An upload is not proof of recovery;
+complete the off-production restore test as soon as possible if it is deferred.
+
+On the client VM, from the updated, verified release directory, install and
+start the timer (not the backup service):
+
+```bash
+sudo install -o root -g root -m 0644 lib/bookstack-dr-backup.timer /etc/systemd/system/bookstack-dr-backup.timer &&
+  sudo systemctl daemon-reload &&
+  sudo systemctl enable --now bookstack-dr-backup.timer &&
+  systemctl list-timers --all bookstack-dr-backup.timer
+```
+
+To pause future runs: `sudo systemctl disable --now bookstack-dr-backup.timer`.
+This does not stop a backup that is already running.
