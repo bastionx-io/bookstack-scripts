@@ -38,7 +38,7 @@ fatal() { printf '%s\n' "$*; stop for review (no automatic cleanup)." >&2; exit 
 [[ -t 0 && -t 1 ]] || fatal 'Interactive terminal required; do not pipe inputs or log the session'
 exec 3<>/dev/tty
 trap 'printf "Setup failed; retain partial state for private review. No job was started.\n" >&2' ERR
-for command_name in age python3 systemctl sha256sum stat dirname cat install chmod stty; do
+for command_name in age python3 systemctl sha256sum stat dirname cat install chmod; do
   command -v "$command_name" >/dev/null 2>&1 || fatal 'Required local tool missing'
 done
 
@@ -81,19 +81,15 @@ check_targets() {
 }
 check_targets
 
-tty_state="$(stty -g <&3)"
-trap 'stty "$tty_state" <&3' EXIT
 trap 'fatal "Setup interrupted"' INT TERM HUP
-stty -echo <&3
-printf '%s\n' 'Setup only. Enter reviewed private values locally; all inputs are hidden.' \
+printf '%s\n' 'Setup only. Typed settings are visible; S3 credentials come from the environment and are never printed.' \
   'Never enter a private identity, APP_KEY or database password. Do not share secret input,' \
   'terminal recordings or screenshots of private keys. No application .env is read.' \
   'Confirm the exact prefix matches the separately reviewed retention lifecycle; setup does not apply it.' >&3
 read_field() {
   printf '%s: ' "$2" >&3
-  IFS= read -r -s -u 3 "$1" || fatal 'Input interrupted'
-  printf '\n' >&3
-  [[ -n "${!1}" && "${!1}" != *AGE-SECRET* && "${!1}" != *PRIVATE*KEY* && "${!1}" != *$'\r'* ]] || fatal 'Empty input or forbidden key/control material'
+  IFS= read -r -u 3 "$1" || fatal 'Input interrupted'
+  [[ -n "${!1}" && "${!1}" != *AGE-SECRET* && "${!1}" != *PRIVATE*KEY* && "${!1}" != *$'\r'* ]] || fatal "Invalid input for $2 (empty or forbidden key/control material)"
 }
 read_field source_url 'Source APP_URL (reviewed HTTPS URL)'
 read_field endpoint 'S3 endpoint (reviewed HTTPS URL)'
@@ -103,13 +99,14 @@ read_field prefix 'S3 prefix (reviewed lifecycle-matching value, no leading/trai
 read_field recipient 'age PUBLIC recipient (age1...)'
 
 # Values go over stdin, not process arguments or environment. No network calls.
-if ! printf '%s\n' "$source_url" "$endpoint" "$bucket" "$region" "$prefix" "$recipient" "$access_key" "$secret_key" | python3 -c '
+if ! printf '%s\0' "$source_url" "$endpoint" "$bucket" "$region" "$prefix" "$recipient" "$access_key" "$secret_key" | python3 -c '
 import ipaddress, re, sys
 from urllib.parse import urlsplit
-values = sys.stdin.read().splitlines()
-if len(values) != 8:
-    sys.exit(1)
-source, endpoint, bucket, region, prefix, recipient, access, secret = values
+source, endpoint, bucket, region, prefix, recipient, access, secret, _ = sys.stdin.read().split("\0")
+
+def check(label, valid):
+    if not valid:
+        sys.exit(f"Invalid input format: {label}")
 
 def https_url(value):
     if not re.fullmatch(r"[\x21-\x7e]+", value) or any(c in value for c in "@?#\\%"):
@@ -133,22 +130,22 @@ def https_url(value):
     except ValueError:
         return False
 
-valid = https_url(source) and https_url(endpoint)
-valid = valid and bool(re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket))
-valid = valid and not any(part in bucket for part in ("..", ".-", "-."))
+check("Source APP_URL", https_url(source))
+check("S3 endpoint", https_url(endpoint))
+valid_bucket = re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) and not any(part in bucket for part in ("..", ".-", "-."))
 try:
     ipaddress.ip_address(bucket)
-    valid = False
+    valid_bucket = False
 except ValueError:
     pass
-valid = valid and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", region))
-valid = valid and len(prefix) <= 512 and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)*", prefix))
-valid = valid and bool(re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", recipient))
-valid = valid and all(re.fullmatch(r"[A-Za-z0-9/+=._-]{1,256}", key) for key in (access, secret))
-valid = valid and all("AGE-SECRET" not in key and not re.search("PRIVATE.*KEY", key) for key in (access, secret))
-sys.exit(0 if valid else 1)
+check("S3 bucket", valid_bucket)
+check("S3 region", re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", region))
+check("S3 prefix", len(prefix) <= 512 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)*", prefix))
+check("age public recipient", re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", recipient))
+for label, key in (("AWS_ACCESS_KEY_ID", access), ("AWS_SECRET_ACCESS_KEY", secret)):
+    check(label, re.fullmatch(r"[A-Za-z0-9/+=._-]{1,256}", key) and "AGE-SECRET" not in key and not re.search("PRIVATE.*KEY", key))
 '; then
-  fatal 'Invalid input format (values withheld)'
+  fatal 'Input validation failed (values withheld)'
 fi
 # Only a native public recipient is accepted: no plugins, identities or network.
 age --encrypt --recipient "$recipient" </dev/null >/dev/null 2>&1 || fatal 'Invalid age public recipient'

@@ -148,14 +148,15 @@ potentially same-UID processes; this is not zero exposure. Changing this environ
 does **not** rotate an already configured root credential file: `02` still refuses
 existing targets; updating persisted credentials needs a separate approved change.
 Do not pipe inputs, pass credentials as arguments, redirect the input session to a
-log, share terminal recordings, or screenshot private keys. Xtrace and terminal
-echo are disabled before helper input. No values are printed
-back. Never enter an age private identity, BookStack `APP_KEY` or database
+log, share terminal recordings, or screenshot private keys. Xtrace is disabled.
+Typed settings are visible, but the helper never prints S3 credentials.
+Validation errors name the failing field without printing its value.
+Never enter an age private identity, BookStack `APP_KEY` or database
 password. The application `.env` is neither read nor changed during setup.
 
 Prepare these reviewed values through the approved private handoff; none has a
 blind default. Credentials come only from the exported pair, not prompts.
-Prompts appear in this exact order (all input is hidden):
+Prompts appear in this exact order:
 
 1. `Source APP_URL (reviewed HTTPS URL)`
 2. `S3 endpoint (reviewed HTTPS URL)`
